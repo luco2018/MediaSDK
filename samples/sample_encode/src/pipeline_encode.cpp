@@ -262,6 +262,7 @@ void CEncTaskPool::Close()
 sTask::sTask()
     : EncSyncP(0)
     , pWriter(NULL)
+    , extBufs(NULL)
 {
     MSDK_ZERO_MEMORY(mfxBS);
 }
@@ -1117,6 +1118,8 @@ CEncodingPipeline::CEncodingPipeline()
 #endif
     m_hwdev = NULL;
 
+    m_round_in = NULL;
+
     MSDK_ZERO_MEMORY(m_mfxEncParams);
     MSDK_ZERO_MEMORY(m_mfxVppParams);
 
@@ -1415,6 +1418,10 @@ mfxStatus CEncodingPipeline::Init(sInputParams *pParams)
     sts = ResetMFXComponents(pParams);
     MSDK_CHECK_STATUS(sts, "ResetMFXComponents failed");
 
+    sts = AllocExtBuffers(pParams);
+    MSDK_CHECK_STATUS(sts, "Alloc extend buffer failed");
+
+
     InitV4L2Pipeline(pParams);
 
     m_nFramesToProcess = pParams->nNumFrames;
@@ -1502,6 +1509,47 @@ void CEncodingPipeline::InsertIDR(bool bIsNextFrameIDR)
     }
 }
 
+mfxStatus CEncodingPipeline::InitEncFrameParams(sTask* pTask)
+{
+    MSDK_CHECK_POINTER(pTask, MFX_ERR_NULL_PTR);
+
+    mfxStatus sts = MFX_ERR_NONE;
+
+    pTask->extBufs = m_encExtBufs.GetFreeSet();
+    MSDK_CHECK_POINTER(pTask->extBufs, MFX_ERR_NULL_PTR);
+
+    for (std::vector<mfxExtBuffer*>::iterator it = pTask->extBufs->buffers.begin();
+            it != pTask->extBufs->buffers.end(); ++it)
+    {
+        switch ((*it)->BufferId)
+        {
+            case MFX_EXTBUFF_AVC_ROUNDING_OFFSET:
+                if (m_round_in)
+                {
+                    mfxExtAVCRoundingOffset *pAVCRoundingOffset = reinterpret_cast<mfxExtAVCRoundingOffset*>(*it);
+
+                    SAFE_FREAD(&pAVCRoundingOffset->EnableRoundingIntra, sizeof(mfxU16), 1, m_round_in, MFX_ERR_MORE_DATA);
+                    SAFE_FREAD(&pAVCRoundingOffset->RoundingOffsetIntra, sizeof(mfxU16), 1, m_round_in, MFX_ERR_MORE_DATA);
+                    SAFE_FREAD(&pAVCRoundingOffset->EnableRoundingInter, sizeof(mfxU16), 1, m_round_in, MFX_ERR_MORE_DATA);
+                    SAFE_FREAD(&pAVCRoundingOffset->RoundingOffsetInter, sizeof(mfxU16), 1, m_round_in, MFX_ERR_MORE_DATA);
+                }
+                break;
+
+            default:
+                msdk_printf(MSDK_STRING("Unsupported extension buffer, ignored\n"));
+                break;
+        }
+    }
+
+    if(!pTask->extBufs->buffers.empty())
+    {
+        m_encCtrl.NumExtParam = (mfxU16)(pTask->extBufs->buffers.size());
+        m_encCtrl.ExtParam    = pTask->extBufs->buffers.data();
+    }
+
+    return sts;
+}
+
 void CEncodingPipeline::Close()
 {
     if (m_FileWriters.first)
@@ -1546,6 +1594,14 @@ void CEncodingPipeline::Close()
 
     m_FileReader.Close();
     FreeFileWriters();
+
+    if(m_round_in)
+    {
+        fclose(m_round_in);
+        m_round_in = NULL;
+    }
+
+    m_encExtBufs.Clear();
 
     // allocator if used as external for MediaSDK must be deleted after SDK components
     DeleteAllocator();
@@ -1663,6 +1719,62 @@ mfxStatus CEncodingPipeline::ResetMFXComponents(sInputParams* pParams)
     return MFX_ERR_NONE;
 }
 
+mfxStatus CEncodingPipeline::AllocExtBuffers(sInputParams *pInParams)
+{
+    MSDK_CHECK_POINTER(pInParams, MFX_ERR_NULL_PTR);
+    mfxStatus sts = MFX_ERR_NONE;
+
+    bufSet* tmpForInit   = NULL;
+    mfxExtAVCRoundingOffset* m_AvcRoundingOffset = NULL;
+
+    mfxU16  numOfFields  = pInParams->nPicStruct != MFX_PICSTRUCT_PROGRESSIVE ? 2 : 1;
+    mfxU16  numOfBuffers = pInParams->nGopRefDist * 2 + pInParams->nAsyncDepth + pInParams->nNumRefFrame + 1;
+
+    bool enableRoundingOffset = pInParams->RoundingOffsetFile && pInParams->CodecId == MFX_CODEC_AVC;
+    if (enableRoundingOffset && m_round_in == NULL)
+    {
+        MSDK_FOPEN(m_round_in, pInParams->RoundingOffsetFile, MSDK_CHAR("rb"));
+        if (m_round_in == NULL) {
+            msdk_printf(MSDK_STRING("ERROR: Can't open file %s\n"), pInParams->RoundingOffsetFile);
+            return MFX_ERR_UNSUPPORTED;
+        }
+
+        msdk_printf(MSDK_STRING("Using rounding offset input file: %s\n"), pInParams->RoundingOffsetFile);
+    }
+
+    for (int k = 0; k < numOfBuffers; k++)
+    {
+        tmpForInit = new bufSet(numOfFields);
+
+        for (mfxU16 fieldId = 0; fieldId < numOfFields; fieldId++)
+        {
+            // for rounding offset configuration
+            if(enableRoundingOffset)
+            {
+                if(fieldId == 0){
+                    m_AvcRoundingOffset = new mfxExtAVCRoundingOffset[numOfFields];
+                    MSDK_CHECK_POINTER(m_AvcRoundingOffset, MFX_ERR_MEMORY_ALLOC);
+                }
+
+                MSDK_ZERO_MEMORY(m_AvcRoundingOffset[fieldId]);
+                m_AvcRoundingOffset[fieldId].Header.BufferId = MFX_EXTBUFF_AVC_ROUNDING_OFFSET;
+                m_AvcRoundingOffset[fieldId].Header.BufferSz = sizeof(mfxExtAVCRoundingOffset);
+            }
+        }
+
+        if(enableRoundingOffset)
+        {
+            for (mfxU16 fieldId = 0; fieldId < numOfFields; fieldId++)
+            {
+                tmpForInit->buffers.push_back(reinterpret_cast<mfxExtBuffer*>(&m_AvcRoundingOffset[fieldId]));
+            }
+        }
+
+        m_encExtBufs.AddSet(tmpForInit);
+    }
+
+    return sts;
+}
 mfxStatus CEncodingPipeline::AllocateSufficientBuffer(mfxBitstream* pBS)
 {
     MSDK_CHECK_POINTER(pBS, MFX_ERR_NULL_PTR);
@@ -1885,6 +1997,10 @@ mfxStatus CEncodingPipeline::Run()
         for (;;)
         {
             InsertIDR(m_bInsertIDR);
+
+            sts = InitEncFrameParams(pCurrentTask);
+            MSDK_CHECK_STATUS(sts, "ENCODE: InitEncFrameParams failed");
+
             // at this point surface for encoder contains either a frame from file or a frame processed by vpp
             sts = m_pmfxENC->EncodeFrameAsync(&m_encCtrl, &m_pEncSurfaces[nEncSurfIdx], &pCurrentTask->mfxBS, &pCurrentTask->EncSyncP);
             m_bInsertIDR = false;
